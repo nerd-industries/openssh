@@ -22,8 +22,9 @@
     Run with:  irm openssh.nerdyneighbor.net | iex   (elevated PowerShell)
     Remove with: irm openssh-uninstall.nerdyneighbor.net | iex
 
-    Connect from the LAN:  ssh Administrator@<pc-name-or-ip>
-    (uses this box's default key, id_ed25519 / claude-debug)
+    Connect from the LAN:  ssh <your-admin-user>@<pc-name-or-ip>
+    (any Administrators-group user; the admin key works for all of them.
+     uses this box's default key, id_ed25519 / claude-debug)
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -167,12 +168,22 @@ try {
     $ip = (Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp,Manual -ErrorAction SilentlyContinue |
            Where-Object { $_.IPAddress -notlike "169.254.*" } | Select-Object -First 1 -ExpandProperty IPAddress)
 
+    # Show the connect command for the actual logged-in user. Prefer the
+    # interactive console user (correct even when the script is elevated as a
+    # different admin), falling back to whoever is running it. The admin key
+    # authorizes any Administrators-group account, so this is just the label.
+    $loginUser = $env:USERNAME
+    try {
+        $csUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+        if ($csUser) { $loginUser = ($csUser -split '\\')[-1] }
+    } catch { }
+
     Write-Host ""
     Write-Host "OpenSSH installed and locked to LAN." -ForegroundColor Green
     Write-Host ""
-    Write-Host "  Connect from the LAN:"
-    Write-Host "    ssh Administrator@$($env:COMPUTERNAME)"
-    if ($ip) { Write-Host "    ssh Administrator@$ip" }
+    Write-Host "  Connect from the LAN (any Administrators-group user):"
+    Write-Host "    ssh $loginUser@$($env:COMPUTERNAME)"
+    if ($ip) { Write-Host "    ssh $loginUser@$ip" }
     Write-Host ""
 }
 catch {
