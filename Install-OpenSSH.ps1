@@ -22,6 +22,10 @@
     Run with:  irm openssh.nerdyneighbor.net | iex   (elevated PowerShell)
     Remove with: irm openssh-uninstall.nerdyneighbor.net | iex
 
+    Windows 7: needs WMF 5.1, and PowerShell there defaults to TLS 1.0, so run
+      [Net.ServicePointManager]::SecurityProtocol='Tls12'; irm openssh.nerdyneighbor.net | iex
+    (firewall/IP steps use netsh/WMI automatically when the Win8+ cmdlets are missing)
+
     Connect from the LAN:  ssh <your-admin-user>@<pc-name-or-ip>
     (any Administrators-group user; the admin key works for all of them.
      uses this box's default key, id_ed25519 / claude-debug)
@@ -40,6 +44,11 @@ $MirrorUrl        = "https://bd.nerdindustries.net/OpenSSH-Win64.zip"   # fast p
 $FirewallRuleName = "OpenSSH-Server-In-TCP-LAN"
 
 function Show-Step { param([string]$m) Write-Host "==> $m" -ForegroundColor Cyan }
+
+# Windows 7 has no NetSecurity/NetTCPIP modules (not even with WMF 5.1), so the
+# firewall and IP steps fall back to netsh / WMI there.
+$HasNetSecurity = [bool](Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)
+$RuleDisplay    = "OpenSSH SSH Server (LAN only)"
 
 # Fast download: WebClient straight to disk (no IWR buffering/progress), BITS fallback.
 function Get-File {
@@ -65,7 +74,7 @@ function Get-OpenSSHZip {
         throw "downloaded zip looks incomplete"
     } catch {
         Show-Step "GitHub unavailable ($($_.Exception.Message)) - falling back to nerdindustries mirror..."
-        $cb = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $cb = [DateTime]::UtcNow.Ticks
         Get-File "$MirrorUrl`?t=$cb" $Dest
         return "mirror"
     }
@@ -75,6 +84,9 @@ try {
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw "This script must be run as Administrator."
+    }
+    if ($PSVersionTable.PSVersion.Major -lt 3) {
+        throw "PowerShell $($PSVersionTable.PSVersion) is too old - install WMF 5.1 first (Windows 7: needs SP1 + .NET 4.5.2)."
     }
 
     # --- 1) Remove any prior OpenSSH services so the install is clean --------
@@ -105,6 +117,10 @@ try {
 
     if (Test-Path $InstallDir) { Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue }
     Move-Item -Path $extracted.FullName -Destination $InstallDir -Force
+    # A move keeps %TEMP%'s ACL (SYSTEM, Administrators, current user only). sshd's
+    # unprivileged per-connection helper then can't read libcrypto.dll and every
+    # connection resets at key exchange. Reset to normal inherited Program Files ACL.
+    & icacls.exe $InstallDir /reset /T /C /Q | Out-Null
     Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item $zip   -Force        -ErrorAction SilentlyContinue
 
@@ -143,30 +159,51 @@ try {
 
     # --- 5) Firewall: TCP 22 inbound, LAN (LocalSubnet) only ----------------
     Show-Step "Configuring firewall: TCP 22 inbound, LocalSubnet only..."
-    foreach ($dn in @("OpenSSH-Server-In-TCP","OpenSSH SSH Server","OpenSSH SSH Server (sshd)","sshd")) {
-        Get-NetFirewallRule -DisplayName $dn -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-    }
-    Get-NetFirewallRule -Name $FirewallRuleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    $oldRules = @("OpenSSH-Server-In-TCP","OpenSSH SSH Server","OpenSSH SSH Server (sshd)","sshd")
+    if ($HasNetSecurity) {
+        foreach ($dn in $oldRules) {
+            Get-NetFirewallRule -DisplayName $dn -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        }
+        Get-NetFirewallRule -Name $FirewallRuleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
-    New-NetFirewallRule `
-        -Name $FirewallRuleName `
-        -DisplayName "OpenSSH SSH Server (LAN only)" `
-        -Description "Inbound TCP 22 restricted to LocalSubnet for sshd.exe" `
-        -Enabled True -Direction Inbound -Action Allow -Protocol TCP `
-        -LocalPort 22 -RemoteAddress LocalSubnet -Profile Any `
-        -Program (Join-Path $InstallDir "sshd.exe") | Out-Null
+        New-NetFirewallRule `
+            -Name $FirewallRuleName `
+            -DisplayName $RuleDisplay `
+            -Description "Inbound TCP 22 restricted to LocalSubnet for sshd.exe" `
+            -Enabled True -Direction Inbound -Action Allow -Protocol TCP `
+            -LocalPort 22 -RemoteAddress LocalSubnet -Profile Any `
+            -Program (Join-Path $InstallDir "sshd.exe") | Out-Null
+    } else {
+        # netsh addresses rules by display name
+        foreach ($dn in $oldRules + @($FirewallRuleName, $RuleDisplay)) {
+            & netsh.exe advfirewall firewall delete rule name="$dn" | Out-Null
+        }
+        & netsh.exe advfirewall firewall add rule name="$RuleDisplay" dir=in action=allow protocol=TCP localport=22 `
+            remoteip=localsubnet profile=any program="$(Join-Path $InstallDir 'sshd.exe')" enable=yes | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "netsh could not add the firewall rule." }
+    }
 
     # --- 6) Verify + report -------------------------------------------------
     Show-Step "Verifying..."
     $sshd = Get-Service sshd
     Write-Host "    sshd: $($sshd.Status) (startup: $($sshd.StartType))"
-    $rule = Get-NetFirewallRule -Name $FirewallRuleName
-    $port = $rule | Get-NetFirewallPortFilter
-    $addr = $rule | Get-NetFirewallAddressFilter
-    Write-Host "    Firewall: enabled=$($rule.Enabled) profile=$($rule.Profile) port=$($port.LocalPort) from=$($addr.RemoteAddress -join ',')"
+    if ($HasNetSecurity) {
+        $rule = Get-NetFirewallRule -Name $FirewallRuleName
+        $port = $rule | Get-NetFirewallPortFilter
+        $addr = $rule | Get-NetFirewallAddressFilter
+        Write-Host "    Firewall: enabled=$($rule.Enabled) profile=$($rule.Profile) port=$($port.LocalPort) from=$($addr.RemoteAddress -join ',')"
+    } else {
+        $rule = & netsh.exe advfirewall firewall show rule name="$RuleDisplay" | Select-String 'Enabled|Profiles|LocalPort|RemoteIP'
+        Write-Host "    Firewall: $(($rule | ForEach-Object { ($_.Line -replace '\s+', ' ').Trim() }) -join '; ')"
+    }
 
-    $ip = (Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp,Manual -ErrorAction SilentlyContinue |
-           Where-Object { $_.IPAddress -notlike "169.254.*" } | Select-Object -First 1 -ExpandProperty IPAddress)
+    if (Get-Command Get-NetIPAddress -ErrorAction SilentlyContinue) {
+        $ip = (Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp,Manual -ErrorAction SilentlyContinue |
+               Where-Object { $_.IPAddress -notlike "169.254.*" } | Select-Object -First 1 -ExpandProperty IPAddress)
+    } else {
+        $ip = Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | ForEach-Object { $_.IPAddress } |
+              Where-Object { $_ -match '^\d+\.' -and $_ -notlike "169.254.*" } | Select-Object -First 1
+    }
 
     # Show the connect command for the actual logged-in user. Prefer the
     # interactive console user (correct even when the script is elevated as a
@@ -192,5 +229,5 @@ catch {
     if ($_.InvocationInfo.ScriptLineNumber) {
         Write-Host "  at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor DarkGray
     }
-    exit 1
+    return   # not exit: under irm | iex, exit closes the tech's PowerShell window
 }

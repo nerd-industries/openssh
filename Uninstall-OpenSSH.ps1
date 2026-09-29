@@ -28,6 +28,8 @@ $OurKeyBody       = "AAAAC3NzaC1lZDI1NTE5AAAAIAQwebAP+RXnuDkk5VFYlQlvWpf6BZFZU6k
 
 function Show-Step { param([string]$m) Write-Host "==> $m" -ForegroundColor Cyan }
 
+$HasNetSecurity = [bool](Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue)
+
 try {
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -46,9 +48,15 @@ try {
 
     # --- 2) Firewall rules ---------------------------------------------------
     Show-Step "Removing firewall rules..."
-    Get-NetFirewallRule -Name $FirewallRuleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-    foreach ($dn in @("OpenSSH SSH Server (LAN only)","OpenSSH-Server-In-TCP","OpenSSH SSH Server","OpenSSH SSH Server (sshd)","sshd")) {
-        Get-NetFirewallRule -DisplayName $dn -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    $ruleNames = @("OpenSSH SSH Server (LAN only)","OpenSSH-Server-In-TCP","OpenSSH SSH Server","OpenSSH SSH Server (sshd)","sshd")
+    if ($HasNetSecurity) {
+        Get-NetFirewallRule -Name $FirewallRuleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        foreach ($dn in $ruleNames) {
+            Get-NetFirewallRule -DisplayName $dn -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        }
+    } else {
+        # Windows 7: no NetSecurity module; netsh addresses rules by display name
+        foreach ($dn in $ruleNames + @($FirewallRuleName)) { & netsh.exe advfirewall firewall delete rule name="$dn" | Out-Null }
     }
 
     # --- 3) Authorized key ---------------------------------------------------
@@ -66,6 +74,22 @@ try {
     }
 
     # --- 4) Install + data dirs ---------------------------------------------
+    # install-sshd.ps1 registered an event-log provider from this folder; unregister
+    # it before the manifest is deleted, like the bundled uninstall-sshd.ps1 does.
+    $etwman = Join-Path $InstallDir "openssh-events.man"
+    if (Test-Path $etwman) {
+        Show-Step "Unregistering OpenSSH event log provider..."
+        & wevtutil.exe um "$etwman" 2>&1 | Out-Null
+    }
+    # Newer install-sshd.ps1 adds the install dir to the machine PATH.
+    $envKey  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+    # Read the raw value so %SystemRoot%-style entries aren't expanded on write-back.
+    $mPath   = (Get-Item $envKey).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+    $newPath = ($mPath -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ne $InstallDir) }) -join ';'
+    if ($newPath -ne $mPath) {
+        Show-Step "Removing $InstallDir from the system PATH..."
+        Set-ItemProperty $envKey -Name Path -Value $newPath -Type ExpandString
+    }
     foreach ($dir in @($InstallDir, $SshDataDir)) {
         if (Test-Path $dir) {
             Show-Step "Removing $dir"
@@ -75,7 +99,12 @@ try {
     }
 
     # --- 5) Windows capability (if OpenSSH was installed via FoD) ------------
-    $cap = Get-WindowsCapability -Online -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'OpenSSH.Server*' -and $_.State -eq 'Installed' }
+    # Get-WindowsCapability doesn't exist on Windows 7; calling it there would throw
+    # into the catch block and skip the remaining steps.
+    $cap = $null
+    if (Get-Command Get-WindowsCapability -ErrorAction SilentlyContinue) {
+        $cap = Get-WindowsCapability -Online -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'OpenSSH.Server*' -and $_.State -eq 'Installed' }
+    }
     if ($cap) {
         Show-Step "Removing OpenSSH Server Windows capability..."
         $cap | ForEach-Object { Remove-WindowsCapability -Online -Name $_.Name -ErrorAction SilentlyContinue | Out-Null }
@@ -89,14 +118,19 @@ try {
     # --- Verify --------------------------------------------------------------
     Show-Step "Verifying..."
     $svcLeft  = Get-Service sshd -ErrorAction SilentlyContinue
-    $ruleLeft = Get-NetFirewallRule -Name $FirewallRuleName -ErrorAction SilentlyContinue
+    if ($HasNetSecurity) {
+        $ruleLeft = Get-NetFirewallRule -Name $FirewallRuleName -ErrorAction SilentlyContinue
+    } else {
+        & netsh.exe advfirewall firewall show rule name="OpenSSH SSH Server (LAN only)" | Out-Null
+        $ruleLeft = ($LASTEXITCODE -eq 0)
+    }
     $dirLeft  = Test-Path $InstallDir
     if ($svcLeft -or $ruleLeft -or $dirLeft) {
         Write-Host ""
         Write-Host "Partly removed - some traces remain (service=$([bool]$svcLeft) rule=$([bool]$ruleLeft) dir=$dirLeft)." -ForegroundColor Yellow
         Write-Host "Reboot and re-run to finish." -ForegroundColor Yellow
         Write-Host ""
-        exit 1
+        return
     }
 
     Write-Host ""
@@ -109,5 +143,5 @@ catch {
     if ($_.InvocationInfo.ScriptLineNumber) {
         Write-Host "  at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor DarkGray
     }
-    exit 1
+    return   # not exit: under irm | iex, exit closes the tech's PowerShell window
 }

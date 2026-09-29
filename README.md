@@ -16,6 +16,13 @@ irm openssh.nerdyneighbor.net | iex
 irm openssh-uninstall.nerdyneighbor.net | iex
 ```
 
+Windows 7 (needs SP1 + WMF 5.1; PowerShell there defaults to TLS 1.0, which
+GitHub and Cloudflare reject):
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm openssh.nerdyneighbor.net | iex
+```
+
 Connect from the LAN (uses this box's default key, `id_ed25519` / `claude-debug`):
 
 ```
@@ -32,6 +39,14 @@ ssh Administrator@<pc-name-or-ip>
 - Authorizes the admin key in `administrators_authorized_keys` with the correct
   locked-down ACL (SYSTEM + Administrators, no inheritance).
 - Firewall: inbound TCP 22 restricted to `LocalSubnet` (LAN only), Profile Any.
+  Uses `netsh` on Windows 7, which has no `NetSecurity` cmdlets.
+- Resets `C:\Program Files\OpenSSH` to normal inherited Program Files permissions
+  after moving it in from `%TEMP%`. Without `Users` read access, sshd's
+  low-privilege per-connection helper can't load `libcrypto.dll` and every
+  connection is reset at key exchange (`Connection reset ... port 22`).
+
+The uninstaller also unregisters the OpenSSH event-log provider and removes the
+install dir from the system PATH (both added by `install-sshd.ps1`).
 
 ## Delivery
 
